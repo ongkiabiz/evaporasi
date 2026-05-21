@@ -24,11 +24,11 @@
 #define OTA_GITHUB_REPO    "evaporasi"
 
 // Versi firmware yang sedang berjalan di ESP32
-#define FIRMWARE_VERSION   "1.0.1"
+#define FIRMWARE_VERSION   "v1.0.2"
 
 // Interval cek OTA
-#define OTA_CHECK_INTERVAL  30000UL       // 30 detik (TESTING)
-// #define OTA_CHECK_INTERVAL  21600000UL // 6 jam (PRODUCTION)
+// #define OTA_CHECK_INTERVAL  30000UL       // 30 detik (TESTING)
+#define OTA_CHECK_INTERVAL  21600000UL // 6 jam (PRODUCTION)
 
 static unsigned long lastOtaCheck = 0;
 
@@ -130,6 +130,7 @@ void checkAndUpdateOTA() {
   client.setTimeout(15);
 
   HTTPClient http;
+  http.useHTTP10(true);
   http.setTimeout(10000);
 
   if (!http.begin(client, apiUrl)) {
@@ -152,41 +153,55 @@ void checkAndUpdateOTA() {
     return;
   }
 
+
   // Parse JSON dengan filter hemat memori
-  StaticJsonDocument<128> filter;
-  filter["tag_name"]                          = true;
-  filter["assets"][0]["name"]                 = true;
-  filter["assets"][0]["browser_download_url"] = true;
+StaticJsonDocument<128> filter;
+filter["tag_name"]                          = true;
+filter["assets"][0]["name"]                 = true;
+filter["assets"][0]["browser_download_url"] = true;
 
-  DynamicJsonDocument doc(2048);
-  DeserializationError err = deserializeJson(
-    doc, http.getStream(),
-    DeserializationOption::Filter(filter)
-  );
-  http.end(); // Tutup segera setelah dapat data
-  delay(200);
+// Ambil seluruh payload dulu
+String payload = http.getString();
+http.end();
 
-  if (err) {
-    Serial.print("[OTA] Gagal parse JSON: ");
-    Serial.println(err.c_str());
-    Serial.println("[OTA] =========================================\n");
-    return;
-  }
+// Serial.println("[OTA] Payload diterima:");
+// Serial.println(payload);
 
-  // Cek versi
-  String latestTag = doc["tag_name"].as<String>();
-  String latestVer = latestTag;
-  if (latestVer.startsWith("v") || latestVer.startsWith("V")) {
-    latestVer = latestVer.substring(1);
-  }
-  Serial.print("[OTA] Versi GitHub: ");
-  Serial.println(latestVer);
+DynamicJsonDocument doc(4096);
 
-  if (latestVer == String(FIRMWARE_VERSION)) {
-    Serial.println("[OTA] Firmware sudah terbaru.");
-    Serial.println("[OTA] =========================================\n");
-    return;
-  }
+DeserializationError err = deserializeJson(
+  doc,
+  payload,
+  DeserializationOption::Filter(filter)
+);
+
+delay(200);
+
+if (err) {
+  Serial.print("[OTA] Gagal parse JSON: ");
+  Serial.println(err.c_str());
+  Serial.println("[OTA] =========================================\n");
+  return;
+}
+
+// Ambil versi terbaru dari GitHub
+String latestVer = doc["tag_name"].as<String>();
+
+if (!doc["assets"].is<JsonArray>()) {
+  Serial.println("[OTA] Assets release tidak ditemukan!");
+  Serial.println("[OTA] =========================================\n");
+  return;
+}
+
+Serial.print("[OTA] Versi GitHub: ");
+Serial.println(latestVer);
+
+// Bandingkan versi
+if (latestVer == String(FIRMWARE_VERSION)) {
+  Serial.println("[OTA] Firmware sudah terbaru.");
+  Serial.println("[OTA] =========================================\n");
+  return;
+}
 
   // Cari file .bin di assets
   String binUrl = "";
