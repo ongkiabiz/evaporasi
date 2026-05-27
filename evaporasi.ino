@@ -1,24 +1,24 @@
 // ============================================================
 //  EVAPORIMETER OTOMATIS ESP32
-//  Versi Outdoor Stabil + Filter Noise
-//  HX710B + Firebase + OTA + Relay Otomatis
+//  Versi Final — Tanpa Acuan Pagi
 //
-//  FITUR:
-//  ✅ Filter Trimmed Mean
-//  ✅ Moving Average
-//  ✅ Anti Spike Filter
-//  ✅ Validasi Evaporasi
-//  ✅ Pompa Otomatis 06:00–07:00
-//  ✅ Firebase Realtime + History
-//  ✅ OTA Update
-//  ✅ Stabil untuk Lapangan Terbuka
+//  RUMUS EVAPORASI:
+//  E_interval = tinggi_sebelumnya - tinggi_sekarang
+//  E_harian  += E_interval (akumulasi, reset tiap 07:00)
+//
+//  ALUR SESUAI FLOWCHART:
+//  1. Sensor HX710B → ESP32 proses data
+//  2. Hubung WiFi → Sinkronisasi NTP
+//  3. Ukur tinggi air
+//  4. Hitung evaporasi per interval → akumulasi harian
+//  5. Cek jam 06:00–07:00 → kontrol selenoid
+//  6. Kirim ke Firebase + tampil di app
+//  7. Reset evaporasi tiap jam 07:00
 // ============================================================
 
 #include <WiFi.h>
 #include <FirebaseESP32.h>
 #include "time.h"
-#include <OneWire.h>
-#include <DallasTemperature.h>
 #include "ota.h"
 
 OtaStatus otaStatus = {
@@ -29,402 +29,279 @@ OtaStatus otaStatus = {
 // KONFIGURASI
 // ============================================================
 
-#define WIFI_SSID       "Klimatologiot"
-#define WIFI_PASSWORD   "Klimatologiotkk"
+#define WIFI_SSID      "Klimatologiot"
+#define WIFI_PASSWORD  "Klimatologiotkk"
 
-#define FIREBASE_HOST   "klimatologiot-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define FIREBASE_AUTH   "AIzaSyAZrk_k4DQ_ijCa6gp67oRklFMKD2dLcbQ"
+#define FIREBASE_HOST  "klimatologiot-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH  "AIzaSyAZrk_k4DQ_ijCa6gp67oRklFMKD2dLcbQ"
 
-// Firebase Path
-#define PATH_REALTIME     "/Monitoring/realtime"
-#define PATH_HISTORY      "/Monitoring/History"
-#define PATH_ACUAN        "/Monitoring/acuan_pagi_cm"
-#define PATH_PANCI_TERISI "/Monitoring/panci_terisi"
-#define PATH_OTA_TRIGGER  "/Monitoring/ota_trigger"
+#define PATH_REALTIME    "/Monitoring/realtime"
+#define PATH_HISTORY     "/Monitoring/History"
+#define PATH_OTA_TRIGGER "/Monitoring/ota_trigger"
+#define PATH_RESET_EVAP  "/Monitoring/reset_evaporasi"  // "true" = reset akumulasi manual
 
 // ============================================================
 // PIN
 // ============================================================
 
-#define HX710B_OUT   19
-#define HX710B_SCK   18
-
-#define DS18B20_PIN  27
-#define RELAY_PIN    32
+#define HX710B_OUT  19
+#define HX710B_SCK  18
+#define RELAY_PIN   32
 
 // ============================================================
-// KALIBRASI
+// KALIBRASI HX710B
 // ============================================================
 
 const long  D0              = 9626456L;
 const long  DMAX            = 10767088L;
-
 const float TINGGI_ACUAN_CM = 20.0;
 
 // ============================================================
-// JADWAL POMPA
+// JADWAL SELENOID — 06:00–07:00
 // ============================================================
 
 const int JAM_POMPA_MULAI   = 6;
 const int JAM_POMPA_SELESAI = 7;
 
-// ============================================================
-// HYSTERESIS RELAY
-// ============================================================
-
-const float RELAY_BATAS_BAWAH = 19.0;
-const float RELAY_BATAS_ATAS  = 20.0;
+// Standar ketinggian air panci: 200mm = 20cm
+const float STANDAR_TINGGI_CM = 20.0;
 
 // ============================================================
 // INTERVAL
 // ============================================================
 
-const unsigned long INTERVAL_REALTIME = 300000UL;
-const unsigned long INTERVAL_HISTORY  = 600000UL;
-const unsigned long INTERVAL_BACA     = 10000UL;
-const unsigned long INTERVAL_OTA_CEK  = 15000UL;
+const unsigned long INTERVAL_REALTIME = 300000UL;  // 5 menit
+const unsigned long INTERVAL_HISTORY  = 600000UL;  // 10 menit
+const unsigned long INTERVAL_BACA     = 10000UL;   // 10 detik
+const unsigned long INTERVAL_CMD_CEK  = 10000UL;   // 10 detik
 
 // ============================================================
 // VARIABEL GLOBAL
 // ============================================================
 
-FirebaseData      fbdo;
-FirebaseAuth      auth;
-FirebaseConfig    config;
+FirebaseData   fbdo;
+FirebaseAuth   auth;
+FirebaseConfig config;
 
-OneWire           oneWire(DS18B20_PIN);
-DallasTemperature sensors(&oneWire);
+unsigned long lastRealtime = 0;
+unsigned long lastHistory  = 0;
+unsigned long lastBaca     = 0;
+unsigned long lastCmdCek   = 0;
 
-unsigned long lastRealtime      = 0;
-unsigned long lastHistory       = 0;
-unsigned long lastBaca          = 0;
-unsigned long lastOtaCekTrigger = 0;
+// Sensor
+float tinggiSebelumnya = -1.0;  // untuk hitung selisih
 
-// ============================================================
-// FILTER DATA
-// ============================================================
+// Evaporasi akumulasi harian
+float evaporasiHarian_mm = 0.0;
+bool  sudahResetHari     = false;
+int   hariSebelumnya     = -1;
 
-float tinggiSebelumnya = -1.0;
-
-// ============================================================
-// ACUAN PAGI
-// ============================================================
-
-float tinggiPagi_cm   = -1.0;
-bool  acuanSudahDiSet = false;
+// Status
+String statusEvaporasi    = "Rendah";
+bool   relayAktif         = false;
+bool   panciTerisiDikirim = false;
 
 // ============================================================
-// STATUS
-// ============================================================
-
-String statusEvaporasi = "Normal";
-
-bool relayAktif = false;
-bool panciTerisiDikirim = false;
-
-// ============================================================
-// FUNGSI BACA HX710B
+// BACA HX710B
 // ============================================================
 
 unsigned long bacaSatuSampel(bool &sukses) {
-
   sukses = true;
-
   unsigned long t0 = millis();
-
   while (digitalRead(HX710B_OUT) == HIGH) {
-
-    if (millis() - t0 > 2000) {
-      sukses = false;
-      return 0;
-    }
-
+    if (millis() - t0 > 2000) { sukses = false; return 0; }
     yield();
   }
-
   unsigned long count = 0;
-
   for (int i = 0; i < 24; i++) {
-
-    digitalWrite(HX710B_SCK, HIGH);
-    delayMicroseconds(1);
-
+    digitalWrite(HX710B_SCK, HIGH); delayMicroseconds(1);
     count <<= 1;
-
-    digitalWrite(HX710B_SCK, LOW);
-    delayMicroseconds(1);
-
-    if (digitalRead(HX710B_OUT)) {
-      count++;
-    }
+    digitalWrite(HX710B_SCK, LOW);  delayMicroseconds(1);
+    if (digitalRead(HX710B_OUT)) count++;
   }
-
-  digitalWrite(HX710B_SCK, HIGH);
-  delayMicroseconds(1);
-
+  digitalWrite(HX710B_SCK, HIGH); delayMicroseconds(1);
   digitalWrite(HX710B_SCK, LOW);
-
   count ^= 0x800000;
-
   return count;
 }
 
 // ============================================================
-// HITUNG TINGGI AIR STABIL
+// HITUNG TINGGI AIR
+// Trimmed Mean + Anti Spike + Moving Average
 // ============================================================
 
 float hitungTinggi() {
-
   const int N = 50;
-
   bool sukses;
 
-  // Buang pembacaan awal
-  for (int i = 0; i < 5; i++) {
-
-    bacaSatuSampel(sukses);
-
-    delay(10);
-    yield();
-  }
+  // Warm-up
+  for (int i = 0; i < 5; i++) { bacaSatuSampel(sukses); delay(10); yield(); }
 
   unsigned long sampel[N];
-
   int sampelValid = 0;
-
-  // Ambil sampel
   for (int i = 0; i < N; i++) {
-
     unsigned long val = bacaSatuSampel(sukses);
-
-    if (sukses) {
-      sampel[sampelValid++] = val;
-    }
-
-    delay(5);
-    yield();
+    if (sukses) sampel[sampelValid++] = val;
+    delay(5); yield();
   }
+  if (sampelValid < 25) return -99.0;
 
-  // Minimal data valid
-  if (sampelValid < 25) {
-    return -99.0;
-  }
-
-  // =========================================================
-  // SORTING
-  // =========================================================
-
+  // Insertion sort
   for (int i = 1; i < sampelValid; i++) {
-
-    unsigned long key = sampel[i];
-
-    int j = i - 1;
-
-    while (j >= 0 && sampel[j] > key) {
-
-      sampel[j + 1] = sampel[j];
-
-      j--;
-    }
-
-    sampel[j + 1] = key;
+    unsigned long key = sampel[i]; int j = i - 1;
+    while (j >= 0 && sampel[j] > key) { sampel[j+1] = sampel[j]; j--; }
+    sampel[j+1] = key;
   }
 
-  // =========================================================
-  // TRIMMED MEAN
-  // =========================================================
-
+  // Trimmed mean 20–80%
   int awal  = sampelValid * 20 / 100;
   int akhir = sampelValid * 80 / 100;
-
   unsigned long total = 0;
-
-  for (int i = awal; i < akhir; i++) {
-    total += sampel[i];
-  }
-
+  for (int i = awal; i < akhir; i++) total += sampel[i];
   long D_rata = total / (akhir - awal);
 
-  // =========================================================
-  // KONVERSI KE CM
-  // =========================================================
-
-  float tinggi =
-      (float)(D_rata - D0) *
-      TINGGI_ACUAN_CM /
-      (float)(DMAX - D0);
-
-  // Limit
+  // Konversi ke cm
+  float tinggi = (float)(D_rata - D0) * TINGGI_ACUAN_CM / (float)(DMAX - D0);
   if (tinggi < 0.0)  tinggi = 0.0;
   if (tinggi > 30.0) tinggi = 30.0;
 
-  // =========================================================
-  // ANTI SPIKE FILTER
-  // =========================================================
-
+  // Anti Spike: abaikan lonjakan > 1cm
   if (tinggiSebelumnya > 0) {
-
     float selisih = abs(tinggi - tinggiSebelumnya);
-
     if (selisih > 1.0) {
-
-      Serial.println("[FILTER] Spike/noise terdeteksi!");
-
+      Serial.printf("[FILTER] Spike %.3fcm diabaikan, pakai %.3fcm\n",
+                    tinggi, tinggiSebelumnya);
       tinggi = tinggiSebelumnya;
     }
   }
 
-  // =========================================================
-  // MOVING AVERAGE
-  // =========================================================
-
+  // Moving Average 5 sampel
   static float buffer[5];
+  static int   idx   = 0;
+  static bool  penuh = false;
+  buffer[idx++] = tinggi;
+  if (idx >= 5) { idx = 0; penuh = true; }
+  int   n   = penuh ? 5 : idx;
+  float avg = 0;
+  for (int i = 0; i < n; i++) avg += buffer[i];
+  float tinggiFinal = avg / n;
 
-  static int index = 0;
-  static bool penuh = false;
-
-  buffer[index] = tinggi;
-
-  index++;
-
-  if (index >= 5) {
-
-    index = 0;
-
-    penuh = true;
-  }
-
-  int jumlahData = penuh ? 5 : index;
-
-  float totalAvg = 0;
-
-  for (int i = 0; i < jumlahData; i++) {
-    totalAvg += buffer[i];
-  }
-
-  float tinggiFinal = totalAvg / jumlahData;
-
-  tinggiSebelumnya = tinggiFinal;
-
-  Serial.printf("[FILTER] Tinggi Stabil: %.3f cm\n", tinggiFinal);
-
+  Serial.printf("[SENSOR] Tinggi: %.3f cm (%.1f mm)\n",
+                tinggiFinal, tinggiFinal * 10.0);
   return tinggiFinal;
 }
 
 // ============================================================
-// BACA ACUAN FIREBASE
+// HITUNG EVAPORASI INTERVAL
+// Dipanggil setiap pembacaan sensor
 // ============================================================
 
-bool bacaAcuanDariFirebase(float &hasil) {
-
-  if (!Firebase.ready()) return false;
-
-  if (!Firebase.getFloat(fbdo, PATH_ACUAN)) return false;
-
-  float val = fbdo.floatData();
-
-  if (val > 0.0 && val <= 30.0) {
-
-    hasil = val;
-
-    return true;
+float hitungEvaporasiInterval(float tinggi_cm) {
+  // Pembacaan pertama — belum ada data sebelumnya
+  if (tinggiSebelumnya < 0) {
+    tinggiSebelumnya = tinggi_cm;
+    return 0.0;
   }
 
-  return false;
+  float delta = tinggiSebelumnya - tinggi_cm;
+  tinggiSebelumnya = tinggi_cm;  // update untuk interval berikutnya
+
+  // Hanya akumulasi jika air benar-benar turun
+  // delta negatif = air naik (isi/hujan) → abaikan
+  // delta > 0.5cm per 10 detik = tidak wajar (noise) → abaikan
+  if (delta <= 0.0 || delta > 0.5) {
+    if (delta < -0.5) {
+      Serial.printf("[INFO] Air naik %.2fcm, diabaikan dari evaporasi\n", -delta);
+    }
+    return 0.0;
+  }
+
+  float evap_mm = delta * 10.0;
+  Serial.printf("[EVAP] Interval: %.4f mm\n", evap_mm);
+  return evap_mm;
 }
 
 // ============================================================
-// NOTIFIKASI PANCI TERISI
+// RESET EVAPORASI HARIAN
 // ============================================================
 
-void kirimNotifikasiPanciTerisi(const String &waktu) {
+void resetEvaporasiHarian(const String &waktu) {
+  Serial.printf("[RESET] Evaporasi harian kemarin: %.2f mm\n", evaporasiHarian_mm);
+  evaporasiHarian_mm = 0.0;
+  sudahResetHari     = true;
 
+  // Simpan info reset ke Firebase
+  if (Firebase.ready()) {
+    FirebaseJson j;
+    j.add("evaporasi_mm",    0.0);
+    j.add("reset_jam",       waktu);
+    Firebase.updateNode(fbdo, PATH_REALTIME, j);
+  }
+  Serial.printf("[RESET] Evaporasi direset jam %s\n", waktu.c_str());
+}
+
+// ============================================================
+// CEK PERINTAH FIREBASE
+// ============================================================
+
+void cekPerintahFirebase(const String &waktu) {
   if (!Firebase.ready()) return;
 
-  FirebaseJson jsonNotif;
+  // Reset evaporasi manual dari aplikasi
+  if (Firebase.getBool(fbdo, PATH_RESET_EVAP) && fbdo.boolData()) {
+    Serial.println("[CMD] Reset evaporasi manual diterima!");
+    Firebase.setBool(fbdo, PATH_RESET_EVAP, false);
+    evaporasiHarian_mm = 0.0;
+    Serial.println("[CMD] Evaporasi direset ke 0");
+  }
 
-  jsonNotif.add("terisi", true);
-  jsonNotif.add("waktu", waktu);
-
-  if (Firebase.updateNode(fbdo, PATH_PANCI_TERISI, jsonNotif)) {
-
-    Serial.println("[NOTIF] Panci terisi terkirim!");
-
-  } else {
-
-    Serial.println("[NOTIF] Gagal: " + fbdo.errorReason());
+  // OTA trigger
+  if (Firebase.getBool(fbdo, PATH_OTA_TRIGGER) && fbdo.boolData()) {
+    Serial.println("[OTA] Trigger diterima!");
+    Firebase.setBool(fbdo, PATH_OTA_TRIGGER, false);
+    forceCheckOTA();
   }
 }
 
 // ============================================================
-// KONTROL RELAY
+// KONTROL SELENOID — sesuai flowchart
 // ============================================================
 
-void kontrolRelay(
-  float tinggi_cm,
-  int jam,
-  int menit,
-  const String &waktuStr
-) {
-
-  bool jamOperasional =
-      (jam >= JAM_POMPA_MULAI &&
-       jam < JAM_POMPA_SELESAI);
-
-  // =========================================================
-  // LUAR JAM
-  // =========================================================
+void kontrolSelenoid(float tinggi_cm, int jam, const String &waktuStr) {
+  bool jamOperasional = (jam >= JAM_POMPA_MULAI && jam < JAM_POMPA_SELESAI);
 
   if (!jamOperasional) {
-
     if (relayAktif) {
-
       digitalWrite(RELAY_PIN, LOW);
-
       relayAktif = false;
-
-      Serial.println("[RELAY] OFF — luar jam");
+      Serial.println("[SELENOID] OFF — luar jam 06:00-07:00");
     }
-
-    if (jam >= JAM_POMPA_SELESAI) {
-      panciTerisiDikirim = false;
-    }
-
+    if (jam >= JAM_POMPA_SELESAI) panciTerisiDikirim = false;
     return;
   }
 
-  // =========================================================
-  // RELAY ON
-  // =========================================================
-
-  if (!relayAktif &&
-      tinggi_cm < RELAY_BATAS_BAWAH) {
-
-    digitalWrite(RELAY_PIN, HIGH);
-
-    relayAktif = true;
-
-    Serial.println("[RELAY] ON");
-  }
-
-  // =========================================================
-  // RELAY OFF
-  // =========================================================
-
-  else if (relayAktif &&
-           tinggi_cm >= RELAY_BATAS_ATAS) {
-
-    digitalWrite(RELAY_PIN, LOW);
-
-    relayAktif = false;
-
-    Serial.println("[RELAY] OFF — target tercapai");
-
-    if (!panciTerisiDikirim) {
-
-      kirimNotifikasiPanciTerisi(waktuStr);
-
-      panciTerisiDikirim = true;
+  // Jam operasional: cek ketinggian
+  if (tinggi_cm < STANDAR_TINGGI_CM) {
+    if (!relayAktif) {
+      digitalWrite(RELAY_PIN, HIGH);
+      relayAktif = true;
+      Serial.printf("[SELENOID] ON — %.1fmm < 200mm\n", tinggi_cm * 10.0);
+    }
+  } else {
+    if (relayAktif) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayAktif = false;
+      Serial.printf("[SELENOID] OFF — %.1fmm >= 200mm\n", tinggi_cm * 10.0);
+      if (!panciTerisiDikirim) {
+        if (Firebase.ready()) {
+          FirebaseJson j;
+          j.add("terisi", true);
+          j.add("waktu",  waktuStr);
+          Firebase.updateNode(fbdo, "/Monitoring/panci_terisi", j);
+        }
+        panciTerisiDikirim = true;
+        Serial.println("[NOTIF] Panci terisi terkirim!");
+      }
     }
   }
 }
@@ -434,102 +311,45 @@ void kontrolRelay(
 // ============================================================
 
 void setup() {
-
   Serial.begin(115200);
-
   Serial.println("\n=== EVAPORIMETER STARTUP ===");
 
   pinMode(HX710B_OUT, INPUT);
+  pinMode(HX710B_SCK, OUTPUT); digitalWrite(HX710B_SCK, LOW);
+  pinMode(RELAY_PIN,  OUTPUT); digitalWrite(RELAY_PIN,  LOW);
 
-  pinMode(HX710B_SCK, OUTPUT);
-  digitalWrite(HX710B_SCK, LOW);
-
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
-
-  sensors.begin();
-  sensors.setResolution(12);
-
-  // =========================================================
-  // WIFI
-  // =========================================================
-
+  // WiFi
   WiFi.mode(WIFI_STA);
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
   Serial.print("Menghubungkan WiFi");
-
   unsigned long tWifi = millis();
-
   while (WiFi.status() != WL_CONNECTED) {
-
-    if (millis() - tWifi > 15000) {
-
-      Serial.println("\n[WiFi] Gagal!");
-
-      ESP.restart();
-    }
-
-    delay(500);
-
-    Serial.print(".");
-
-    yield();
+    if (millis() - tWifi > 15000) { Serial.println("\n[WiFi] Gagal!"); ESP.restart(); }
+    delay(500); Serial.print("."); yield();
   }
+  Serial.println("\nWiFi OK! IP: " + WiFi.localIP().toString());
 
-  Serial.println("\nWiFi OK!");
-
-  // =========================================================
   // NTP
-  // =========================================================
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Sinkronisasi NTP");
+  struct tm t;
+  unsigned long tNtp = millis();
+  while (!getLocalTime(&t)) {
+    if (millis() - tNtp > 10000) { Serial.println(" GAGAL!"); break; }
+    delay(500); Serial.print("."); yield();
+  }
+  Serial.println(" OK!");
 
-  configTime(
-    7 * 3600,
-    0,
-    "pool.ntp.org",
-    "time.nist.gov"
-  );
-
-  Serial.println("Sinkronisasi NTP...");
-
-  // =========================================================
-  // FIREBASE
-  // =========================================================
-
+  // Firebase
   config.host = FIREBASE_HOST;
-
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
-
   Firebase.begin(&config, &auth);
-
   Firebase.reconnectWiFi(true);
-
   delay(1000);
 
-  // =========================================================
-  // BACA ACUAN
-  // =========================================================
-
-  Serial.println("Membaca acuan pagi...");
-
-  if (bacaAcuanDariFirebase(tinggiPagi_cm)) {
-
-    acuanSudahDiSet = true;
-
-    Serial.printf(
-      "[OK] Acuan: %.2f cm\n",
-      tinggiPagi_cm
-    );
-
-  } else {
-
-    acuanSudahDiSet = false;
-
-    Serial.println("[WARNING] Acuan belum diset!");
-  }
-
   Serial.println("=== SETUP SELESAI ===");
+  Serial.println("[INFO] Evaporasi dihitung per interval, akumulasi harian");
+  Serial.println("[INFO] Reset otomatis tiap jam 07:00\n");
 }
 
 // ============================================================
@@ -538,291 +358,115 @@ void setup() {
 
 void loop() {
 
-  // =========================================================
-  // WIFI RECONNECT
-  // =========================================================
-
+  // WiFi reconnect
   if (WiFi.status() != WL_CONNECTED) {
-
     Serial.println("[WiFi] Reconnecting...");
-
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    delay(5000);
-
-    return;
+    delay(5000); return;
   }
 
-  // =========================================================
-  // OTA CHECK
-  // =========================================================
-
-  if (millis() - lastOtaCekTrigger >= INTERVAL_OTA_CEK) {
-
-    lastOtaCekTrigger = millis();
-
-    if (Firebase.ready() &&
-        Firebase.getBool(fbdo, PATH_OTA_TRIGGER)) {
-
-      if (fbdo.boolData()) {
-
-        Serial.println("[OTA] Trigger diterima!");
-
-        Firebase.setBool(fbdo, PATH_OTA_TRIGGER, false);
-
-        forceCheckOTA();
-      }
-    }
-  }
-
+  // OTA rutin 6 jam
   checkAndUpdateOTA();
 
-  // =========================================================
-  // INTERVAL BACA SENSOR
-  // =========================================================
-
-  if (millis() - lastBaca < INTERVAL_BACA) {
-    return;
-  }
-
+  // Throttle 10 detik
+  if (millis() - lastBaca < INTERVAL_BACA) return;
   lastBaca = millis();
 
-  // =========================================================
-  // TINGGI AIR
-  // =========================================================
-
+  // ── STEP 1: Ukur tinggi air ──
   float tinggi_cm = hitungTinggi();
-
   if (tinggi_cm == -99.0) {
-
     Serial.println("[WARNING] Sensor timeout!");
-
     return;
   }
 
-  // =========================================================
-  // SUHU
-  // =========================================================
+  // ── STEP 2: Hitung evaporasi interval & akumulasi ──
+  float evap_interval = hitungEvaporasiInterval(tinggi_cm);
+  evaporasiHarian_mm += evap_interval;
 
-  sensors.requestTemperatures();
+  // Batas wajar harian max 15mm
+  if (evaporasiHarian_mm > 15.0) evaporasiHarian_mm = 15.0;
 
-  float suhuAir = sensors.getTempCByIndex(0);
-
-  if (suhuAir == DEVICE_DISCONNECTED_C) {
-    suhuAir = -99.0;
-  }
-
-  // =========================================================
-  // WAKTU
-  // =========================================================
-
+  // ── STEP 3: Waktu ──
   struct tm timeinfo;
-
   String datetime = "0000-00-00 00:00:00";
   String tanggal  = "0000-00-00";
   String jamMenit = "--:--";
-
-  bool adaWaktu = getLocalTime(&timeinfo);
+  bool   adaWaktu = getLocalTime(&timeinfo);
 
   if (adaWaktu) {
+    char buf[25], bufJM[6];
+    strftime(buf,   sizeof(buf),   "%Y-%m-%d %H:%M:%S", &timeinfo); datetime = buf;
+    strftime(buf,   sizeof(buf),   "%Y-%m-%d",           &timeinfo); tanggal  = buf;
+    strftime(bufJM, sizeof(bufJM), "%H:%M",              &timeinfo); jamMenit = bufJM;
 
-    char buf[25];
-
-    strftime(
-      buf,
-      sizeof(buf),
-      "%Y-%m-%d %H:%M:%S",
-      &timeinfo
-    );
-
-    datetime = buf;
-
-    strftime(
-      buf,
-      sizeof(buf),
-      "%Y-%m-%d",
-      &timeinfo
-    );
-
-    tanggal = buf;
-
-    char bufJM[6];
-
-    strftime(
-      bufJM,
-      sizeof(bufJM),
-      "%H:%M",
-      &timeinfo
-    );
-
-    jamMenit = bufJM;
-
-    // =======================================================
-    // RELAY
-    // =======================================================
-
-    if (tinggi_cm > 0 &&
-        tinggi_cm <= 30.0) {
-
-      kontrolRelay(
-        tinggi_cm,
-        timeinfo.tm_hour,
-        timeinfo.tm_min,
-        jamMenit
-      );
-
-    } else {
-
-      digitalWrite(RELAY_PIN, LOW);
-
-      relayAktif = false;
-
-      Serial.println("[RELAY] Sensor invalid!");
+    // Reset harian jam 07:00
+    if (hariSebelumnya != timeinfo.tm_mday) {
+      hariSebelumnya = timeinfo.tm_mday;
+      sudahResetHari = false;
     }
-  }
-
-  // =========================================================
-  // EVAPORASI
-  // =========================================================
-
-  float evaporasi_cm = 0.0;
-  float evaporasi_mm = 0.0;
-
-  if (acuanSudahDiSet) {
-
-    float raw =
-        tinggiPagi_cm - tinggi_cm;
-
-    evaporasi_cm =
-        (raw < 0.0) ? 0.0 : raw;
-
-    evaporasi_mm =
-        evaporasi_cm * 10.0;
-
-    // =======================================================
-    // VALIDASI
-    // =======================================================
-
-    if (evaporasi_mm > 15.0) {
-
-      Serial.println(
-        "[WARNING] Evaporasi tidak wajar!"
-      );
-
-      evaporasi_mm = 15.0;
+    if (timeinfo.tm_hour == 7 && timeinfo.tm_min == 0 && !sudahResetHari) {
+      resetEvaporasiHarian(jamMenit);
     }
+
+    // Cek perintah Firebase
+    if (millis() - lastCmdCek >= INTERVAL_CMD_CEK) {
+      lastCmdCek = millis();
+      cekPerintahFirebase(jamMenit);
+    }
+
+    // ── STEP 4: Kontrol selenoid jam 06:00–07:00 ──
+    kontrolSelenoid(tinggi_cm, timeinfo.tm_hour, jamMenit);
   }
 
-  // =========================================================
-  // STATUS
-  // =========================================================
+  // ── STEP 5: Status evaporasi ──
+  if      (evaporasiHarian_mm > 10.0) statusEvaporasi = "Tinggi";
+  else if (evaporasiHarian_mm >= 2.0) statusEvaporasi = "Normal";
+  else                                statusEvaporasi = "Rendah";
 
-  if (!acuanSudahDiSet) {
-
-    statusEvaporasi = "Acuan Belum Diset";
-
-  } else if (evaporasi_mm > 10) {
-
-    statusEvaporasi = "Tinggi";
-
-  } else if (evaporasi_mm >= 2) {
-
-    statusEvaporasi = "Normal";
-
-  } else {
-
-    statusEvaporasi = "Rendah";
-  }
-
-  // =========================================================
-  // REALTIME FIREBASE
-  // =========================================================
-
+  // ── STEP 6: Kirim ke Firebase ──
   if (millis() - lastRealtime >= INTERVAL_REALTIME) {
-
     lastRealtime = millis();
-
     if (Firebase.ready()) {
-
       FirebaseJson jsonRT;
+      jsonRT.add("tinggi_air_cm",     tinggi_cm);
+      jsonRT.add("tinggi_air_mm",     tinggi_cm * 10.0);
+      jsonRT.add("evaporasi_mm",      evaporasiHarian_mm);
+      jsonRT.add("status",            statusEvaporasi);
+      jsonRT.add("selenoid_aktif",    relayAktif);
+      jsonRT.add("datetime",          datetime);
+      jsonRT.add("ota_versi_device",  otaStatus.versiSekarang);
+      jsonRT.add("ota_versi_terbaru", otaStatus.versiTerbaru);
+      jsonRT.add("ota_status",        otaStatus.statusTerakhir);
+      jsonRT.add("ota_waktu_cek",     otaStatus.waktuCekTerakhir);
 
-      jsonRT.add("tinggi_air_cm", tinggi_cm);
-      jsonRT.add("evaporasi_mm", evaporasi_mm);
-      jsonRT.add("suhu_air_c", suhuAir);
-      jsonRT.add("status", statusEvaporasi);
-      jsonRT.add("relay_aktif", relayAktif);
-      jsonRT.add("datetime", datetime);
-
-      Firebase.updateNode(
-        fbdo,
-        PATH_REALTIME,
-        jsonRT
-      );
-
-      Serial.println("[Firebase] Realtime OK");
+      if (Firebase.updateNode(fbdo, PATH_REALTIME, jsonRT))
+        Serial.println("[Firebase] Realtime OK");
+      else
+        Serial.println("[Firebase] GAGAL: " + fbdo.errorReason());
     }
   }
-
-  // =========================================================
-  // HISTORY
-  // =========================================================
 
   if (millis() - lastHistory >= INTERVAL_HISTORY) {
-
     lastHistory = millis();
-
-    if (Firebase.ready() &&
-        acuanSudahDiSet) {
-
+    if (Firebase.ready()) {
       FirebaseJson jsonH;
-
       jsonH.add("tinggi_air_cm", tinggi_cm);
-      jsonH.add("evaporasi_mm", evaporasi_mm);
-      jsonH.add("suhu_air_c", suhuAir);
-      jsonH.add("status", statusEvaporasi);
-      jsonH.add("datetime", datetime);
-      jsonH.add("tanggal", tanggal);
-
-      Firebase.pushJSON(
-        fbdo,
-        PATH_HISTORY,
-        jsonH
-      );
-
+      jsonH.add("tinggi_air_mm", tinggi_cm * 10.0);
+      jsonH.add("evaporasi_mm",  evaporasiHarian_mm);
+      jsonH.add("status",        statusEvaporasi);
+      jsonH.add("datetime",      datetime);
+      jsonH.add("tanggal",       tanggal);
+      Firebase.pushJSON(fbdo, PATH_HISTORY, jsonH);
       Serial.println("[Firebase] History OK");
     }
   }
 
-  // =========================================================
-  // SERIAL MONITOR
-  // =========================================================
-
+  // ── Serial Monitor ──
   Serial.println("================================");
-
-  Serial.printf(
-    "Tinggi Air : %.3f cm\n",
-    tinggi_cm
-  );
-
-  Serial.printf(
-    "Evaporasi  : %.2f mm\n",
-    evaporasi_mm
-  );
-
-  Serial.printf(
-    "Suhu Air   : %.2f C\n",
-    suhuAir
-  );
-
-  Serial.printf(
-    "Status     : %s\n",
-    statusEvaporasi.c_str()
-  );
-
-  Serial.printf(
-    "Relay      : %s\n",
-    relayAktif ? "ON" : "OFF"
-  );
-
+  Serial.printf("Waktu      : %s\n",   datetime.c_str());
+  Serial.printf("Tinggi Air : %.3f cm (%.1f mm)\n", tinggi_cm, tinggi_cm * 10.0);
+  Serial.printf("Evaporasi  : %.2f mm (harian)\n",  evaporasiHarian_mm);
+  Serial.printf("Status     : %s\n",   statusEvaporasi.c_str());
+  Serial.printf("Selenoid   : %s\n",   relayAktif ? "ON" : "OFF");
   Serial.println("================================");
 }
