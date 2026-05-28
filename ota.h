@@ -18,7 +18,7 @@
 // ============================================================
 #define OTA_GITHUB_USER     "ongkiabiz"
 #define OTA_GITHUB_REPO     "evaporasi"
-#define FIRMWARE_VERSION    "v1.0."
+#define FIRMWARE_VERSION    "v1.0.7"
 // #define OTA_CHECK_INTERVAL  21600000UL   // 6 jam (PRODUCTION)
 #define OTA_CHECK_INTERVAL  30000UL   // 30 detik (TESTING)
 

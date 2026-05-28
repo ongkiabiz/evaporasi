@@ -1,6 +1,6 @@
 // ============================================================
 //  EVAPORIMETER OTOMATIS ESP32
-//  Versi Final — DMAX Dinamis
+//  Versi Final — DMAX Dinamis + Mode Kalibrasi D0/DMAX
 //
 //  RUMUS EVAPORASI:
 //  E_interval = tinggi_sebelumnya - tinggi_sekarang
@@ -10,6 +10,11 @@
 //  - DMAX = max(semua pembacaan raw ADC sejak boot/reset)
 //  - Disimpan ke NVS (lokal) + Firebase RTDB (cloud)
 //  - Bisa direset dari app Flutter via Firebase
+//
+//  KALIBRASI D0 & DMAX:
+//  - D0   : kirim calib_trigger = "d0"   saat panci KOSONG
+//  - DMAX : kirim calib_trigger = "dmax" saat air tepat 20 cm
+//  - Status kalibrasi dikembalikan via calib_status di Firebase
 //
 //  ALUR SESUAI FLOWCHART:
 //  1. Sensor HX710B → ESP32 proses data
@@ -50,7 +55,10 @@ Preferences prefs;
 #define PATH_RESET_EVAP     "/Monitoring/reset_evaporasi"
 #define PATH_SETTINGS       "/Monitoring/settings/evaporasi"
 #define PATH_DMAX           "/Monitoring/settings/evaporasi/dmax"
+#define PATH_D0             "/Monitoring/settings/evaporasi/d0"
 #define PATH_RESET_DMAX     "/Monitoring/reset_dmax"
+#define PATH_CALIB_TRIGGER  "/Monitoring/calib_trigger"   // "d0" / "dmax" / "idle"
+#define PATH_CALIB_STATUS   "/Monitoring/calib_status"    // feedback ke app Flutter
 
 // ============================================================
 // PIN
@@ -62,11 +70,12 @@ Preferences prefs;
 
 // ============================================================
 // KALIBRASI HX710B
+// Kedua variabel sekarang bisa diperbarui dari kalibrasi lapangan
 // ============================================================
 
-const long  D0              = 9626456L;       // nilai raw saat panci kosong
-long        DMAX            = 10767088L;      // DINAMIS — diperbarui otomatis
-const float TINGGI_ACUAN_CM = 20.0;           // tinggi air saat DMAX (cm)
+long        D0              = 9626456L;       // raw saat panci KOSONG  — dikalibrasi via app
+long        DMAX            = 10767088L;      // raw saat air 20 cm     — dikalibrasi via app
+const float TINGGI_ACUAN_CM = 20.0;           // tinggi air referensi DMAX (cm), jangan ubah
 
 // ============================================================
 // JADWAL SELENOID — 06:00–07:00
@@ -94,10 +103,10 @@ FirebaseData   fbdo;
 FirebaseAuth   auth;
 FirebaseConfig config;
 
-unsigned long lastRealtime   = 0;
-unsigned long lastHistory    = 0;
-unsigned long lastBaca       = 0;
-unsigned long lastCmdCek     = 0;
+unsigned long lastRealtime    = 0;
+unsigned long lastHistory     = 0;
+unsigned long lastBaca        = 0;
+unsigned long lastCmdCek      = 0;
 unsigned long lastSettingsCek = 0;
 
 // ── Settings yang bisa diubah dari app ───────────────────────
@@ -121,25 +130,85 @@ bool   relayAktif           = false;
 bool   panciTerisiDikirim   = false;
 
 // ============================================================
+// NVS + FIREBASE: SIMPAN & MUAT D0
+// D0 = nilai raw saat panci kosong (titik nol sensor)
+// ============================================================
+
+/**
+ * Simpan D0 ke NVS (lokal) dan Firebase (cloud).
+ * Dipanggil setelah kalibrasi panci kosong berhasil.
+ */
+void simpanD0(long nilaiD0) {
+  // 1. Simpan ke NVS agar bertahan saat restart
+  prefs.begin("evap", false);
+  prefs.putLong("d0", nilaiD0);
+  prefs.end();
+
+  // 2. Simpan ke Firebase sebagai backup cloud
+  if (Firebase.ready()) {
+    if (Firebase.setInt(fbdo, PATH_D0, (int)nilaiD0)) {
+      Serial.printf("[CALIB] D0 disimpan ke NVS + Firebase: %ld\n", nilaiD0);
+    } else {
+      Serial.printf("[CALIB] D0 NVS OK, Firebase GAGAL: %s\n",
+                    fbdo.errorReason().c_str());
+    }
+  } else {
+    Serial.printf("[CALIB] Firebase belum siap, D0 hanya di NVS: %ld\n", nilaiD0);
+  }
+}
+
+/**
+ * Muat D0 saat boot.
+ * Prioritas: NVS → Firebase → nilai default hardcode.
+ */
+void muatD0() {
+  // 1. Coba NVS
+  prefs.begin("evap", true);
+  long d0Nvs = prefs.getLong("d0", -1);
+  prefs.end();
+
+  if (d0Nvs > 0) {
+    D0 = d0Nvs;
+    Serial.printf("[CALIB] D0 dimuat dari NVS: %ld\n", D0);
+    return;
+  }
+
+  // 2. Fallback ke Firebase
+  Serial.println("[CALIB] D0 NVS kosong, mencoba Firebase...");
+  if (Firebase.ready()) {
+    if (Firebase.getInt(fbdo, PATH_D0)) {
+      long d0Fb = (long)fbdo.intData();
+      if (d0Fb > 0) {
+        D0 = d0Fb;
+        prefs.begin("evap", false);
+        prefs.putLong("d0", D0);
+        prefs.end();
+        Serial.printf("[CALIB] D0 dimuat dari Firebase + disimpan ke NVS: %ld\n", D0);
+        return;
+      }
+    }
+  }
+
+  // 3. Pakai default
+  Serial.printf("[CALIB] D0 pakai nilai default hardcode: %ld\n", D0);
+}
+
+// ============================================================
 // NVS + FIREBASE: SIMPAN & MUAT DMAX
 // ============================================================
 
 /**
  * Simpan DMAX ke NVS (lokal) dan Firebase (cloud).
- * Dipanggil setiap kali DMAX diperbarui atau direset.
  */
 void simpanDmax(long nilaiDmax) {
-  // 1. Simpan ke NVS agar bertahan saat restart
   prefs.begin("evap", false);
   prefs.putLong("dmax", nilaiDmax);
   prefs.end();
 
-  // 2. Simpan ke Firebase sebagai backup cloud
   if (Firebase.ready()) {
     if (Firebase.setInt(fbdo, PATH_DMAX, (int)nilaiDmax)) {
       Serial.printf("[DMAX] Disimpan ke NVS + Firebase: %ld\n", nilaiDmax);
     } else {
-      // Firebase gagal — NVS tetap tersimpan
       Serial.printf("[DMAX] NVS OK, Firebase GAGAL: %s\n",
                     fbdo.errorReason().c_str());
     }
@@ -151,10 +220,9 @@ void simpanDmax(long nilaiDmax) {
 
 /**
  * Muat DMAX saat boot.
- * Urutan prioritas: NVS → Firebase → default hardcode.
+ * Prioritas: NVS → Firebase → nilai default hardcode.
  */
 void muatDmax() {
-  // 1. Coba baca dari NVS (paling cepat, tidak perlu koneksi)
   prefs.begin("evap", true);
   long dmaxNvs = prefs.getLong("dmax", -1);
   prefs.end();
@@ -165,30 +233,26 @@ void muatDmax() {
     return;
   }
 
-  // 2. NVS kosong → fallback ke Firebase
   Serial.println("[DMAX] NVS kosong, mencoba Firebase...");
   if (Firebase.ready()) {
     if (Firebase.getInt(fbdo, PATH_DMAX)) {
       long dmaxFb = (long)fbdo.intData();
       if (dmaxFb > 0) {
         DMAX = dmaxFb;
-        // Sinkronkan ke NVS untuk restart berikutnya
         prefs.begin("evap", false);
         prefs.putLong("dmax", DMAX);
         prefs.end();
-        Serial.printf("[DMAX] Dimuat dari Firebase + disimpan ke NVS: %ld\n",
-                      DMAX);
+        Serial.printf("[DMAX] Dimuat dari Firebase + disimpan ke NVS: %ld\n", DMAX);
         return;
       }
     }
   }
 
-  // 3. Tidak ada di NVS atau Firebase → pakai default
   Serial.printf("[DMAX] Pakai nilai default: %ld\n", DMAX);
 }
 
 // ============================================================
-// BACA HX710B (RAW ADC)
+// BACA HX710B: SATU SAMPEL RAW ADC
 // ============================================================
 
 unsigned long bacaSatuSampel(bool &sukses) {
@@ -212,16 +276,15 @@ unsigned long bacaSatuSampel(bool &sukses) {
 }
 
 // ============================================================
-// HITUNG TINGGI AIR
-// Trimmed Mean + Anti Spike + Moving Average
-// DMAX diperbarui otomatis jika ada nilai raw lebih besar
+// BACA SENSOR RAW — TRIMMED MEAN (dipakai oleh kalibrasi & normal)
+// Mengembalikan nilai rata-rata ADC, atau -1 jika gagal.
 // ============================================================
 
-float hitungTinggi() {
+long bacaSensorRaw() {
   const int N = 50;
   bool sukses;
 
-  // Buang 5 sampel pertama (warmup)
+  // Buang 5 sampel pertama (warmup sensor)
   for (int i = 0; i < 5; i++) { bacaSatuSampel(sukses); delay(10); yield(); }
 
   // Kumpulkan sampel valid
@@ -232,9 +295,9 @@ float hitungTinggi() {
     if (sukses) sampel[sampelValid++] = val;
     delay(5); yield();
   }
-  if (sampelValid < 25) return -99.0;
+  if (sampelValid < 25) return -1;
 
-  // Urutkan sampel (insertion sort)
+  // Insertion sort
   for (int i = 1; i < sampelValid; i++) {
     unsigned long key = sampel[i]; int j = i - 1;
     while (j >= 0 && sampel[j] > key) { sampel[j+1] = sampel[j]; j--; }
@@ -246,18 +309,29 @@ float hitungTinggi() {
   int   akhir = sampelValid * 80 / 100;
   unsigned long total = 0;
   for (int i = awal; i < akhir; i++) total += sampel[i];
-  long D_rata = (long)(total / (akhir - awal));
+  return (long)(total / (akhir - awal));
+}
+
+// ============================================================
+// HITUNG TINGGI AIR (mode operasional normal)
+// Trimmed Mean + Anti Spike + Moving Average
+// DMAX diperbarui otomatis jika ada nilai raw lebih besar
+// ============================================================
+
+float hitungTinggi() {
+  long D_rata = bacaSensorRaw();
+  if (D_rata < 0) return -99.0;   // sensor timeout
 
   // ── UPDATE DMAX OTOMATIS ─────────────────────────────────
-  // Jika nilai raw rata-rata lebih besar dari DMAX yang tersimpan,
-  // artinya air lebih tinggi dari sebelumnya → perbarui DMAX
+  // Jika nilai raw rata-rata lebih besar dari DMAX tersimpan,
+  // artinya air lebih tinggi → perbarui DMAX
   if (D_rata > DMAX) {
     Serial.printf("[DMAX] Update otomatis: %ld → %ld\n", DMAX, D_rata);
     DMAX = D_rata;
     simpanDmax(DMAX);
   }
 
-  // Konversi raw ADC ke tinggi air (cm)
+  // Konversi raw ADC → tinggi air (cm)
   // Rumus: tinggi = (D_rata - D0) / (DMAX - D0) * TINGGI_ACUAN_CM
   float tinggi = (float)(D_rata - D0) * TINGGI_ACUAN_CM /
                  (float)(DMAX - D0);
@@ -299,7 +373,6 @@ float hitungTinggi() {
 // ============================================================
 
 float hitungEvaporasiInterval(float tinggi_cm) {
-  // Pembacaan pertama — belum ada referensi sebelumnya
   if (tinggiSebelumnya < 0) {
     tinggiSebelumnya = tinggi_cm;
     Serial.printf("[EVAP] Referensi awal: %.3f cm\n", tinggiSebelumnya);
@@ -307,10 +380,10 @@ float hitungEvaporasiInterval(float tinggi_cm) {
   }
 
   float delta = tinggiSebelumnya - tinggi_cm;
-  tinggiSebelumnya = tinggi_cm;  // simpan untuk interval berikutnya
+  tinggiSebelumnya = tinggi_cm;
 
-  // delta <= 0 → air naik (hujan/isi selenoid) → abaikan
-  // delta > 0.5 cm per interval → tidak wajar (noise) → abaikan
+  // delta <= 0  → air naik (hujan / selenoid) → abaikan
+  // delta > 0.5 → lonjakan tidak wajar → abaikan
   if (delta <= 0.0 || delta > 0.5) {
     if (delta < -0.5) {
       Serial.printf("[INFO] Air naik %.2fcm, diabaikan dari evaporasi\n",
@@ -319,9 +392,8 @@ float hitungEvaporasiInterval(float tinggi_cm) {
     return 0.0;
   }
 
-  // Konversi cm → mm, tambahkan koreksi offset dari settings
   float evap_mm = (delta * 10.0f) + cfg_koreksiOffset;
-  if (evap_mm < 0.0f) evap_mm = 0.0f;  // clamp — tidak boleh negatif
+  if (evap_mm < 0.0f) evap_mm = 0.0f;
 
   Serial.printf("[EVAP] Interval: %.4f mm (delta: %.4fcm, offset: %.2fmm)\n",
                 evap_mm, delta, cfg_koreksiOffset);
@@ -348,22 +420,132 @@ void resetEvaporasiHarian(const String &waktu) {
 }
 
 // ============================================================
-// CEK PERINTAH DARI FIREBASE (dari app Flutter)
+// PROSES KALIBRASI D0 / DMAX (dari app Flutter via Firebase)
+//
+// Alur:
+//   1. App tulis calib_trigger = "d0" atau "dmax"
+//   2. ESP32 baca trigger tiap 10 detik
+//   3. ESP32 baca 50 sampel sensor, hitung trimmed mean
+//   4. Simpan D0 atau DMAX ke NVS + Firebase
+//   5. Tulis calib_status = "ok_d0" / "ok_dmax" / "error_..."
+//   6. App baca calib_status untuk konfirmasi
+// ============================================================
+
+void prosesKalibrasi() {
+  if (!Firebase.ready()) return;
+
+  FirebaseData fdoK;
+  if (!Firebase.getString(fdoK, PATH_CALIB_TRIGGER)) return;
+
+  String trigger = fdoK.stringData();
+  trigger.trim();
+  if (trigger == "" || trigger == "idle") return;
+
+  Serial.printf("[CALIB] Trigger diterima: '%s'\n", trigger.c_str());
+
+  // Reset trigger lebih dulu agar tidak dieksekusi berulang
+  Firebase.setString(fbdo, PATH_CALIB_TRIGGER, "idle");
+  Firebase.setString(fbdo, PATH_CALIB_STATUS,  "reading");
+
+  Serial.println("[CALIB] Membaca sensor (50 sampel trimmed mean)...");
+  long rawVal = bacaSensorRaw();
+
+  if (rawVal < 0) {
+    Firebase.setString(fbdo, PATH_CALIB_STATUS, "error_sensor_timeout");
+    Serial.println("[CALIB] GAGAL — sensor timeout, kurang dari 25 sampel valid!");
+    return;
+  }
+
+  Serial.printf("[CALIB] Nilai raw hasil baca: %ld\n", rawVal);
+
+  // ──────────────────────────────────────────────────────────
+  //  KALIBRASI D0 — panci harus kosong
+  // ──────────────────────────────────────────────────────────
+  if (trigger == "d0") {
+    D0 = rawVal;
+
+    // Jika D0 baru >= DMAX, reset DMAX ke D0 + margin kecil
+    // agar rumus tidak crash (pembagi = 0 atau negatif)
+    if (D0 >= DMAX) {
+      DMAX = D0 + 1000;
+      simpanDmax(DMAX);
+      Serial.println("[CALIB] DMAX ikut direset karena D0 >= DMAX lama");
+    }
+
+    simpanD0(D0);
+
+    // Kirim hasil ke Firebase settings agar app bisa tampilkan
+    FirebaseJson j;
+    j.add("d0",         (int)D0);
+    j.add("nilai_raw",  (int)rawVal);
+    j.add("keterangan", "Kalibrasi D0 berhasil — panci kosong");
+    Firebase.updateNode(fbdo, PATH_SETTINGS, j);
+    Firebase.setString(fbdo, PATH_CALIB_STATUS, "ok_d0");
+
+    // Reset referensi tinggi agar evaporasi mulai dari nol lagi
+    tinggiSebelumnya = -1.0;
+
+    Serial.printf("[CALIB] D0 BARU: %ld\n", D0);
+    Serial.println("[CALIB] Sekarang isi air tepat 20 cm, lalu kirim trigger 'dmax'");
+
+  // ──────────────────────────────────────────────────────────
+  //  KALIBRASI DMAX — air harus tepat 20 cm
+  // ──────────────────────────────────────────────────────────
+  } else if (trigger == "dmax") {
+
+    // Validasi: nilai raw harus lebih besar dari D0
+    if (rawVal <= D0) {
+      Firebase.setString(fbdo, PATH_CALIB_STATUS, "error_dmax_below_d0");
+      Serial.printf("[CALIB] GAGAL — raw (%ld) <= D0 (%ld)\n", rawVal, D0);
+      Serial.println("[CALIB] Pastikan air sudah mencapai 20 cm dan sensor stabil!");
+      return;
+    }
+
+    DMAX = rawVal;
+    simpanDmax(DMAX);
+
+    long range = DMAX - D0;
+    // Verifikasi: tinggi yang terbaca seharusnya tepat 20 cm
+    float tinggiVerif = (float)(DMAX - D0) * TINGGI_ACUAN_CM / (float)(DMAX - D0);
+
+    // Kirim hasil ke Firebase settings
+    FirebaseJson j;
+    j.add("dmax",       (int)DMAX);
+    j.add("nilai_raw",  (int)rawVal);
+    j.add("range_adc",  (int)range);
+    j.add("tinggi_cm",  TINGGI_ACUAN_CM);
+    j.add("keterangan", "Kalibrasi DMAX berhasil — air 20 cm");
+    Firebase.updateNode(fbdo, PATH_SETTINGS, j);
+    Firebase.setString(fbdo, PATH_CALIB_STATUS, "ok_dmax");
+
+    // Reset referensi tinggi
+    tinggiSebelumnya = -1.0;
+
+    Serial.printf("[CALIB] DMAX BARU: %ld (range: %ld ADC)\n", DMAX, range);
+    Serial.printf("[CALIB] Kalibrasi selesai! D0=%ld | DMAX=%ld\n", D0, DMAX);
+
+  } else {
+    // Trigger tidak dikenal
+    Firebase.setString(fbdo, PATH_CALIB_STATUS, "error_unknown_trigger");
+    Serial.printf("[CALIB] Trigger tidak dikenal: '%s'\n", trigger.c_str());
+  }
+}
+
+// ============================================================
+// CEK PERINTAH DARI FIREBASE (reset, OTA, dll.)
 // ============================================================
 
 void cekPerintahFirebase(const String &waktu) {
   if (!Firebase.ready()) return;
 
-  // ── Reset DMAX (dikirim dari app Flutter) ────────────────
+  // ── Reset DMAX manual dari app ────────────────────────────
   if (Firebase.getBool(fbdo, PATH_RESET_DMAX) && fbdo.boolData()) {
     Serial.println("[CMD] Reset DMAX diterima dari app!");
     Firebase.setBool(fbdo, PATH_RESET_DMAX, false);
-
-    // Reset DMAX ke nilai default (D0 + margin kecil)
-    // ESP akan mencari DMAX baru otomatis dari pembacaan berikutnya
-    DMAX = D0 + 100;  // nilai minimal agar tidak crash di rumus
+    DMAX = D0 + 100;
     simpanDmax(DMAX);
-    Serial.printf("[CMD] DMAX direset, akan update otomatis dari sensor\n");
+    Serial.printf("[CMD] DMAX direset ke D0+100 = %ld, akan update otomatis\n",
+                  DMAX);
   }
 
   // ── Reset evaporasi manual ────────────────────────────────
@@ -466,9 +648,21 @@ void bacaSettings() {
     if (json.get(result, "interval_baca_ms") && result.success)
       cfg_intervalBaca = max((unsigned long)result.to<int>(), 5000UL);
 
+    // ── Sinkronisasi D0 dari Firebase ────────────────────
+    // Jika Firebase punya D0 yang valid dan berbeda dari lokal, sinkronkan
+    if (json.get(result, "d0") && result.success) {
+      long d0Fb = (long)result.to<int>();
+      if (d0Fb > 0 && d0Fb != D0) {
+        Serial.printf("[SETTINGS] D0 Firebase (%ld) != lokal (%ld), sinkron\n",
+                      d0Fb, D0);
+        D0 = d0Fb;
+        prefs.begin("evap", false);
+        prefs.putLong("d0", D0);
+        prefs.end();
+      }
+    }
+
     // ── Sinkronisasi DMAX dari Firebase ──────────────────
-    // Jika nilai DMAX di Firebase lebih besar dari yang ada di memori,
-    // sinkronkan (bisa terjadi jika perangkat lain update Firebase)
     if (json.get(result, "dmax") && result.success) {
       long dmaxFb = (long)result.to<int>();
       if (dmaxFb > DMAX && dmaxFb > D0) {
@@ -481,12 +675,13 @@ void bacaSettings() {
       }
     }
 
+    Serial.printf("[SETTINGS] D0: %ld | DMAX: %ld | Range: %ld\n",
+                  D0, DMAX, DMAX - D0);
     Serial.printf("[SETTINGS] Threshold: %.1f / %.1f mm\n",
                   cfg_thresholdRendah, cfg_thresholdTinggi);
-    Serial.printf("[SETTINGS] Rumus: %s, Offset: %.2f mm\n",
+    Serial.printf("[SETTINGS] Rumus: %s | Offset: %.2f mm\n",
                   cfg_rumusKalibrasi.c_str(), cfg_koreksiOffset);
-    Serial.printf("[SETTINGS] DMAX: %ld | D0: %ld\n", DMAX, D0);
-    Serial.printf("[SETTINGS] Interval — baca: %lums, RT: %lums, Hist: %lums\n",
+    Serial.printf("[SETTINGS] Interval — baca: %lums | RT: %lums | Hist: %lums\n",
                   cfg_intervalBaca, cfg_intervalRealtime, cfg_intervalHistory);
   } else {
     Serial.println("[SETTINGS] Tidak ada settings di Firebase, pakai nilai saat ini.");
@@ -539,17 +734,34 @@ void setup() {
   Firebase.reconnectWiFi(true);
   delay(1000);
 
-  // ── Muat DMAX (NVS → Firebase → default) ─────────────────
+  // ── Muat D0 dan DMAX (NVS → Firebase → default) ──────────
+  muatD0();
   muatDmax();
+
+  // ── Pastikan range ADC valid ──────────────────────────────
+  if (DMAX <= D0) {
+    Serial.println("[WARNING] DMAX <= D0! Kalibrasi diperlukan.");
+    Serial.println("[WARNING] Kirim calib_trigger='d0' saat panci kosong,");
+    Serial.println("[WARNING] lalu calib_trigger='dmax' saat air 20 cm.");
+    DMAX = D0 + 1000;   // sementara agar tidak crash
+  }
 
   // ── Baca semua settings dari Firebase ────────────────────
   bacaSettings();
 
+  // ── Pastikan calib_trigger dalam kondisi idle ─────────────
+  if (Firebase.ready()) {
+    Firebase.setString(fbdo, PATH_CALIB_TRIGGER, "idle");
+  }
+
   Serial.println("\n=== SETUP SELESAI ===");
+  Serial.printf("[INFO] D0   aktif: %ld\n", D0);
   Serial.printf("[INFO] DMAX aktif: %ld\n", DMAX);
+  Serial.printf("[INFO] Range ADC : %ld\n", DMAX - D0);
+  Serial.println("[INFO] Kirim calib_trigger='d0'   untuk kalibrasi panci kosong");
+  Serial.println("[INFO] Kirim calib_trigger='dmax' untuk kalibrasi air 20 cm");
   Serial.println("[INFO] Evaporasi dihitung per interval, akumulasi harian");
-  Serial.println("[INFO] Reset otomatis tiap jam 07:00");
-  Serial.println("[INFO] DMAX diperbarui otomatis dari setiap pembacaan\n");
+  Serial.println("[INFO] Reset otomatis tiap jam 07:00\n");
 }
 
 // ============================================================
@@ -574,6 +786,16 @@ void loop() {
   lastBaca = millis();
 
   // ════════════════════════════════════════════════════════
+  //  CEK KALIBRASI + PERINTAH dari app Flutter
+  //  (dilakukan sebelum baca sensor agar tidak bentrok)
+  // ════════════════════════════════════════════════════════
+  if (millis() - lastCmdCek >= INTERVAL_CMD_CEK) {
+    lastCmdCek = millis();
+    prosesKalibrasi();           // kalibrasi D0 / DMAX
+    cekPerintahFirebase("");     // reset evaporasi, OTA, dll.
+  }
+
+  // ════════════════════════════════════════════════════════
   //  STEP 1: Ukur tinggi air
   //  DMAX diperbarui otomatis di dalam hitungTinggi()
   // ════════════════════════════════════════════════════════
@@ -588,8 +810,6 @@ void loop() {
   // ════════════════════════════════════════════════════════
   float evapInterval = hitungEvaporasiInterval(tinggi_cm);
   evaporasiHarian_mm += evapInterval;
-
-  // Batas wajar harian maksimum 15 mm
   if (evaporasiHarian_mm > 15.0f) evaporasiHarian_mm = 15.0f;
 
   // ════════════════════════════════════════════════════════
@@ -619,12 +839,6 @@ void loop() {
       resetEvaporasiHarian(jamMenit);
     }
 
-    // ── Cek perintah dari app Flutter ────────────────────
-    if (millis() - lastCmdCek >= INTERVAL_CMD_CEK) {
-      lastCmdCek = millis();
-      cekPerintahFirebase(jamMenit);
-    }
-
     // ── STEP 4: Kontrol selenoid (jam 06:00–07:00) ────────
     kontrolSelenoid(tinggi_cm, timeinfo.tm_hour, jamMenit);
   }
@@ -637,7 +851,6 @@ void loop() {
 
   // ════════════════════════════════════════════════════════
   //  STEP 5: Tentukan status evaporasi
-  //  Menggunakan threshold yang bisa diatur dari app
   // ════════════════════════════════════════════════════════
   if      (evaporasiHarian_mm >= cfg_thresholdTinggi) statusEvaporasi = "Tinggi";
   else if (evaporasiHarian_mm >= cfg_thresholdRendah) statusEvaporasi = "Normal";
@@ -656,8 +869,9 @@ void loop() {
       jsonRT.add("status",            statusEvaporasi);
       jsonRT.add("selenoid_aktif",    relayAktif);
       jsonRT.add("datetime",          datetime);
-      jsonRT.add("dmax_saat_ini",     (int)DMAX);       // ← DMAX dinamis
-      jsonRT.add("d0",                (int)D0);
+      jsonRT.add("d0_saat_ini",       (int)D0);           // ← D0 dinamis
+      jsonRT.add("dmax_saat_ini",     (int)DMAX);         // ← DMAX dinamis
+      jsonRT.add("range_adc",         (int)(DMAX - D0));
       jsonRT.add("ota_versi_device",  otaStatus.versiSekarang);
       jsonRT.add("ota_versi_terbaru", otaStatus.versiTerbaru);
       jsonRT.add("ota_status",        otaStatus.statusTerakhir);
@@ -684,7 +898,8 @@ void loop() {
       jsonH.add("status",        statusEvaporasi);
       jsonH.add("datetime",      datetime);
       jsonH.add("tanggal",       tanggal);
-      jsonH.add("dmax_snapshot", (int)DMAX);  // snapshot DMAX saat data diambil
+      jsonH.add("d0_snapshot",   (int)D0);
+      jsonH.add("dmax_snapshot", (int)DMAX);
 
       if (Firebase.pushJSON(fbdo, PATH_HISTORY, jsonH)) {
         Serial.println("[Firebase] History OK");
@@ -705,7 +920,8 @@ void loop() {
                 evaporasiHarian_mm);
   Serial.printf("Status      : %s\n",   statusEvaporasi.c_str());
   Serial.printf("Selenoid    : %s\n",   relayAktif ? "ON" : "OFF");
-  Serial.printf("DMAX        : %ld  (D0: %ld)\n", DMAX, D0);
+  Serial.printf("D0          : %ld\n",  D0);
+  Serial.printf("DMAX        : %ld  (Range: %ld)\n", DMAX, DMAX - D0);
   Serial.printf("Threshold   : Rendah < %.1f | Tinggi >= %.1f mm\n",
                 cfg_thresholdRendah, cfg_thresholdTinggi);
   Serial.println("================================================");
