@@ -1,5 +1,5 @@
 {
-  "additionalFiles": "..\\..,..\\..\\..,..\\..",
+  "additionalFiles": "..\\..,..\\..",
   "builtInLibrariesFolders": "C:\\Users\\ongki abiez\\AppData\\Local\\Arduino15\\libraries",
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "build.warn_data_percentage=75",
