@@ -1,6 +1,6 @@
 // ============================================================
-//  ota.h — OTA Update dari GitHub Releases (ESP32)
-//  + Status OTA bisa dipantau via Firebase Realtime Database
+//  ota.h — OTA Update GitHub Releases ESP32
+//  Versi Stabil untuk Evaporimeter Otomatis
 // ============================================================
 
 #ifndef OTA_H
@@ -14,246 +14,269 @@
 #include <ArduinoJson.h>
 
 // ============================================================
-// KONFIGURASI GITHUB
+// KONFIGURASI OTA
 // ============================================================
-#define OTA_GITHUB_USER     "ongkiabiz"
-#define OTA_GITHUB_REPO     "evaporasi"
-#define FIRMWARE_VERSION    "v1.0.7"
-// #define OTA_CHECK_INTERVAL  21600000UL   // 6 jam (PRODUCTION)
-#define OTA_CHECK_INTERVAL  30000UL   // 30 detik (TESTING)
 
-static unsigned long lastOtaCheck = 0;
+#define OTA_GITHUB_USER "ongkiabiz"
+#define OTA_GITHUB_REPO "evaporasi"
+
+#define FIRMWARE_VERSION "v1.0.1"
+
+// Interval cek OTA
+#define OTA_CHECK_INTERVAL 30000UL
 
 // ============================================================
-// STRUCT STATUS OTA
-// Definisi di sini, instance (otaStatus) di evaporasi.ino
+// STATUS OTA
 // ============================================================
+
 struct OtaStatus {
   String versiSekarang;
   String versiTerbaru;
   String statusTerakhir;
   String errorMsg;
   String waktuCekTerakhir;
-  int    progressPersen;
+  int progressPersen;
 };
 
-// Dideklarasikan extern — instance ada di evaporasi.ino
+// deklarasi extern
 extern OtaStatus otaStatus;
 
 // ============================================================
-// FUNGSI: Resolve redirect URL via raw TCP
+// TIMER OTA
 // ============================================================
-String resolveRedirectUrl(String githubUrl) {
-  String host = "github.com";
-  String path = githubUrl;
-  path.replace("https://github.com", "");
-  path.replace("http://github.com", "");
 
-  Serial.println("[OTA] Resolve URL redirect...");
+static unsigned long lastOtaCheck = 0;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(15);
+// ============================================================
+// CALLBACK PROGRESS OTA
+// ============================================================
 
-  if (!client.connect(host.c_str(), 443)) {
-    Serial.println("[OTA] Gagal konek ke github.com");
-    return githubUrl;
+void otaProgressCallback(int cur, int total) {
+
+  static int lastPercent = -1;
+
+  int percent = 0;
+
+  if (total > 0) {
+    percent = (cur * 100) / total;
   }
 
-  client.print("GET " + path + " HTTP/1.1\r\n");
-  client.print("Host: " + host + "\r\n");
-  client.print("User-Agent: ESP32-OTA-Updater\r\n");
-  client.print("Connection: close\r\n\r\n");
+  otaStatus.progressPersen = percent;
 
-  String location = "";
-  unsigned long t0 = millis();
-  while (millis() - t0 < 8000) {
-    if (client.available()) {
-      String line = client.readStringUntil('\n');
-      line.trim();
-      if (line.startsWith("Location: ") || line.startsWith("location: ")) {
-        location = line.substring(10);
-        location.trim();
-        break;
-      }
-      if (line.length() == 0) break;
+  if (percent != lastPercent) {
+
+    if (percent % 10 == 0) {
+      Serial.printf("[OTA] Download %d%%\n", percent);
     }
-  }
-  client.stop();
-  delay(100);
 
-  if (location.isEmpty()) {
-    Serial.println("[OTA] Tidak ada redirect, pakai URL asli.");
-    return githubUrl;
-  }
-  Serial.println("[OTA] CDN URL ditemukan!");
-  return location;
-}
-
-// ============================================================
-// Progress callback — update otaStatus.progressPersen live
-// ============================================================
-static void otaProgressCallback(int cur, int total) {
-  static int lastPct = -1;
-  int pct = (total > 0) ? (cur * 100 / total) : 0;
-  otaStatus.progressPersen = pct;
-  if (pct != lastPct && pct % 10 == 0) {
-    Serial.printf("[OTA] Download: %d%%\n", pct);
-    lastPct = pct;
+    lastPercent = percent;
   }
 }
 
 // ============================================================
-// FUNGSI UTAMA: Cek update & jalankan OTA dari GitHub
+// FUNGSI CEK OTA
 // ============================================================
+
 void checkAndUpdateOTA() {
-  if (millis() - lastOtaCheck < OTA_CHECK_INTERVAL && lastOtaCheck != 0) return;
+
+  // interval
+  if (millis() - lastOtaCheck < OTA_CHECK_INTERVAL && lastOtaCheck != 0) {
+    return;
+  }
+
   lastOtaCheck = millis();
 
+  // wifi check
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[OTA] WiFi tidak terhubung, skip.");
+
+    Serial.println("[OTA] WiFi tidak terhubung");
+
     otaStatus.statusTerakhir = "WiFi Putus";
+
     return;
   }
 
-  Serial.println("\n[OTA] ======== CEK UPDATE FIRMWARE ========");
-  Serial.printf("[OTA] Versi saat ini: %s\n", FIRMWARE_VERSION);
+  Serial.println();
+  Serial.println("[OTA] ===== CEK UPDATE =====");
 
+  otaStatus.versiSekarang = FIRMWARE_VERSION;
   otaStatus.progressPersen = -1;
-  otaStatus.errorMsg       = "";
+  otaStatus.errorMsg = "";
 
-  String apiUrl = "https://api.github.com/repos/";
-  apiUrl += OTA_GITHUB_USER;
-  apiUrl += "/";
-  apiUrl += OTA_GITHUB_REPO;
-  apiUrl += "/releases/latest";
+  // =========================================================
+  // URL API GITHUB
+  // =========================================================
+
+  String url =
+    "https://api.github.com/repos/" + String(OTA_GITHUB_USER) + "/" + String(OTA_GITHUB_REPO) + "/releases/latest";
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(15);
 
-  HTTPClient http;
-  http.useHTTP10(true);
-  http.setTimeout(10000);
+  HTTPClient https;
 
-  if (!http.begin(client, apiUrl)) {
-    otaStatus.statusTerakhir = "Gagal";
-    otaStatus.errorMsg       = "Gagal konek ke GitHub API";
-    http.end();
-    return;
-  }
+  https.begin(client, url);
 
-  http.addHeader("User-Agent", "ESP32-OTA-Updater");
-  http.addHeader("Accept", "application/vnd.github.v3+json");
+  https.addHeader("User-Agent", "ESP32");
 
-  int httpCode = http.GET();
+  int httpCode = https.GET();
+
   Serial.printf("[OTA] HTTP Code: %d\n", httpCode);
 
-  if (httpCode != 200) {
+  if (httpCode != HTTP_CODE_OK) {
+
     otaStatus.statusTerakhir = "Gagal";
-    otaStatus.errorMsg       = "HTTP Error: " + String(httpCode);
-    http.end();
+    otaStatus.errorMsg =
+      "HTTP Error " + String(httpCode);
+
+    https.end();
+
     return;
   }
 
-  StaticJsonDocument<128> filter;
-  filter["tag_name"]                          = true;
-  filter["assets"][0]["name"]                 = true;
-  filter["assets"][0]["browser_download_url"] = true;
+  // =========================================================
+  // AMBIL JSON
+  // =========================================================
 
-  String payload = http.getString();
-  http.end();
+  String payload = https.getString();
 
-  DynamicJsonDocument doc(4096);
-  DeserializationError err = deserializeJson(
-    doc, payload, DeserializationOption::Filter(filter)
-  );
-  delay(200);
+  https.end();
+
+  DynamicJsonDocument doc(8192);
+
+  DeserializationError err =
+    deserializeJson(doc, payload);
 
   if (err) {
-    otaStatus.statusTerakhir = "Gagal";
-    otaStatus.errorMsg       = "Parse JSON error: " + String(err.c_str());
+
+    otaStatus.statusTerakhir = "JSON Error";
+    otaStatus.errorMsg = err.c_str();
+
+    Serial.println("[OTA] JSON Error");
+
     return;
   }
 
-  String latestVer = doc["tag_name"].as<String>();
-  otaStatus.versiTerbaru = latestVer;
+  // =========================================================
+  // VERSI TERBARU
+  // =========================================================
 
-  if (!doc["assets"].is<JsonArray>()) {
-    otaStatus.statusTerakhir = "Gagal";
-    otaStatus.errorMsg       = "Assets tidak ditemukan di release";
-    return;
-  }
+  String latestVersion =
+    doc["tag_name"].as<String>();
 
-  Serial.printf("[OTA] Versi GitHub: %s\n", latestVer.c_str());
+  otaStatus.versiTerbaru = latestVersion;
 
-  if (latestVer == String(FIRMWARE_VERSION)) {
-    Serial.println("[OTA] Firmware sudah terbaru.");
+  Serial.printf(
+    "[OTA] Versi GitHub: %s\n",
+    latestVersion.c_str());
+
+  // =========================================================
+  // SUDAH TERBARU
+  // =========================================================
+
+  if (latestVersion == String(FIRMWARE_VERSION)) {
+
+    Serial.println("[OTA] Firmware terbaru");
+
     otaStatus.statusTerakhir = "Terbaru";
-    Serial.println("[OTA] =========================================\n");
+
     return;
   }
 
-  String binUrl = "";
-  for (JsonObject asset : doc["assets"].as<JsonArray>()) {
-    String nama = asset["name"].as<String>();
-    if (nama.endsWith(".bin")) {
-      binUrl = asset["browser_download_url"].as<String>();
+  // =========================================================
+  // CARI FILE BIN
+  // =========================================================
+
+  String firmwareUrl = "";
+
+  JsonArray assets = doc["assets"];
+
+  for (JsonObject asset : assets) {
+
+    String name = asset["name"].as<String>();
+
+    if (name.endsWith(".bin")) {
+
+      firmwareUrl =
+        asset["browser_download_url"].as<String>();
+
       break;
     }
   }
 
-  if (binUrl.isEmpty()) {
+  if (firmwareUrl == "") {
+
     otaStatus.statusTerakhir = "Gagal";
-    otaStatus.errorMsg       = "File .bin tidak ada di release";
+    otaStatus.errorMsg = "File BIN tidak ditemukan";
+
+    Serial.println("[OTA] BIN tidak ditemukan");
+
     return;
   }
 
-  Serial.printf("[OTA] *** UPDATE: %s -> %s ***\n", FIRMWARE_VERSION, latestVer.c_str());
-  otaStatus.statusTerakhir = "Mengupdate";
+  // =========================================================
+  // OTA UPDATE
+  // =========================================================
+
+  Serial.println("[OTA] Mulai update firmware");
+
+  otaStatus.statusTerakhir = "Updating";
   otaStatus.progressPersen = 0;
 
-  String finalUrl = resolveRedirectUrl(binUrl);
-  Serial.println("[OTA] Memulai download & flash...");
-  delay(1000);
-
-  WiFiClientSecure clientFw;
-  clientFw.setInsecure();
-  clientFw.setTimeout(60000);
+  WiFiClientSecure updateClient;
+  updateClient.setInsecure();
 
   httpUpdate.onProgress(otaProgressCallback);
-  httpUpdate.rebootOnUpdate(true);
-  httpUpdate.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
-  t_httpUpdate_return ret = httpUpdate.update(clientFw, finalUrl);
+  t_httpUpdate_return ret =
+    httpUpdate.update(updateClient, firmwareUrl);
 
   switch (ret) {
+
     case HTTP_UPDATE_FAILED:
+
       otaStatus.statusTerakhir = "Gagal";
-      otaStatus.progressPersen = -1;
-      otaStatus.errorMsg = "Error(" + String(httpUpdate.getLastError()) + "): "
-                           + httpUpdate.getLastErrorString();
-      Serial.println("[OTA] GAGAL! " + otaStatus.errorMsg);
+
+      otaStatus.errorMsg =
+        httpUpdate.getLastErrorString();
+
+      Serial.printf(
+        "[OTA] Gagal: %s\n",
+        httpUpdate.getLastErrorString().c_str());
+
       break;
+
     case HTTP_UPDATE_NO_UPDATES:
-      otaStatus.statusTerakhir = "Terbaru";
-      otaStatus.progressPersen = -1;
+
+      otaStatus.statusTerakhir = "Tidak Ada Update";
+
+      Serial.println("[OTA] Tidak ada update");
+
       break;
+
     case HTTP_UPDATE_OK:
+
       otaStatus.statusTerakhir = "Berhasil";
+
       otaStatus.progressPersen = 100;
+
+      Serial.println("[OTA] Update berhasil");
+
       break;
   }
 
-  Serial.println("[OTA] =========================================\n");
+  Serial.println("[OTA] =====================");
 }
 
 // ============================================================
-// Paksa cek OTA sekarang (tanpa tunggu interval)
+// FORCE OTA
 // ============================================================
+
 void forceCheckOTA() {
+
   lastOtaCheck = 0;
+
   checkAndUpdateOTA();
 }
 
-#endif // OTA_H
+#endif
