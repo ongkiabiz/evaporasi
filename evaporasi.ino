@@ -1,7 +1,8 @@
 // ============================================================
 //  EVAPORIMETER OTOMATIS ESP32
 //  VERSI PERBAIKAN LENGKAP
-//  Fix: reset harian, watchdog, settings Firebase, selenoid guard
+//  Fix: reset harian, watchdog, settings Firebase, selenoid guard,
+//       OTA trigger Firebase, watchdog bypass saat OTA
 // ============================================================
 
 #include <WiFi.h>
@@ -257,31 +258,36 @@ float bacaSuhuAir() {
 
 void prosesEvaporasiHarian(float tinggi_cm, int jam, int hari) {
 
-  if (jam == 7 && hari != hariTerakhirReset) {
-
-    if (snapshotDiambil && tinggiSnapshot_cm >= 0) {
-
-      float delta = tinggiSnapshot_cm - tinggi_cm;
-
-      evaporasiHarian_mm = (delta > 0) ? delta * 10.0 : 0.0;
-
-      if (evaporasiHarian_mm > 15.0)
-        evaporasiHarian_mm = 15.0;
-
-      prefs.putFloat("evap_harian", evaporasiHarian_mm);
-
-      Serial.printf("[EVAP] %.2f mm\n", evaporasiHarian_mm);
-    }
-
+  // Ambil snapshot awal jika belum ada
+  if (!snapshotDiambil && tinggi_cm > 0) {
     tinggiSnapshot_cm = tinggi_cm;
     snapshotDiambil   = true;
     hariTerakhirReset = hari;
-
     prefs.putFloat("snapshot", tinggiSnapshot_cm);
     prefs.putInt("snapshot_hari", hariTerakhirReset);
     prefs.putBool("snapshot_ok", true);
+    Serial.printf("[EVAP] Snapshot awal: %.2f cm\n", tinggiSnapshot_cm);
+    return;
+  }
 
-    Serial.printf("[EVAP] Snapshot baru %.2f cm\n", tinggiSnapshot_cm);
+  // Reset harian jam 7 → simpan snapshot baru
+  if (jam == 7 && hari != hariTerakhirReset) {
+    tinggiSnapshot_cm = tinggi_cm;
+    snapshotDiambil   = true;
+    hariTerakhirReset = hari;
+    prefs.putFloat("snapshot", tinggiSnapshot_cm);
+    prefs.putInt("snapshot_hari", hariTerakhirReset);
+    prefs.putBool("snapshot_ok", true);
+    Serial.printf("[EVAP] Snapshot reset jam 7: %.2f cm\n", tinggiSnapshot_cm);
+  }
+
+  // Hitung evaporasi REALTIME dari snapshot
+  if (snapshotDiambil && tinggiSnapshot_cm >= 0) {
+    float delta = tinggiSnapshot_cm - tinggi_cm;
+    evaporasiHarian_mm = (delta > 0) ? delta * 10.0 : 0.0;
+    if (evaporasiHarian_mm > 15.0) evaporasiHarian_mm = 15.0;
+    prefs.putFloat("evap_harian", evaporasiHarian_mm);
+    Serial.printf("[EVAP] Realtime: %.2f mm\n", evaporasiHarian_mm);
   }
 }
 
@@ -350,6 +356,7 @@ void kontrolSelenoid(float tinggi_cm, int jam) {
 
 void bacaSettingsFirebase() {
 
+  // ----- Settings interval & selenoid -----
   if (Firebase.getJSON(fbdoRead, PATH_SETTINGS)) {
 
     FirebaseJson &json = fbdoRead.jsonObject();
@@ -373,6 +380,7 @@ void bacaSettingsFirebase() {
     Serial.println("[Settings] OK");
   }
 
+  // ----- Kalibrasi sensor -----
   if (Firebase.getJSON(fbdoRead, PATH_KALIBRASI)) {
 
     FirebaseJson &json = fbdoRead.jsonObject();
@@ -399,6 +407,7 @@ void bacaSettingsFirebase() {
     }
   }
 
+  // ----- Reset evaporasi manual -----
   if (Firebase.getBool(fbdoRead, PATH_RESET_EVAP)) {
 
     if (fbdoRead.boolData() == true) {
@@ -413,6 +422,27 @@ void bacaSettingsFirebase() {
       Firebase.setBool(fbdo, PATH_RESET_EVAP, false);
 
       Serial.println("[Reset] Evaporasi reset");
+    }
+  }
+
+  // ----- OTA trigger dari Firebase -----
+  if (Firebase.getBool(fbdoRead, PATH_OTA_TRIGGER)) {
+
+    if (fbdoRead.boolData() == true) {
+
+      // Reset flag di Firebase dulu sebelum OTA
+      Firebase.setBool(fbdo, PATH_OTA_TRIGGER, false);
+
+      Serial.println("[OTA] Trigger dari Firebase, mulai force OTA...");
+
+      // Lepas watchdog sementara karena download bisa lama
+      esp_task_wdt_delete(NULL);
+
+      forceCheckOTA();
+
+      // Daftarkan kembali ke watchdog (hanya jika OTA gagal;
+      // jika berhasil ESP32 sudah restart otomatis)
+      esp_task_wdt_add(NULL);
     }
   }
 }
@@ -430,7 +460,7 @@ void setup() {
   // =========================================================
 
   esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = WDT_TIMEOUT_SEC * 1000,
+    .timeout_ms    = WDT_TIMEOUT_SEC * 1000,
     .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
     .trigger_panic = true
   };
@@ -552,13 +582,18 @@ void loop() {
   }
 
   // =========================================================
-  // OTA
+  // OTA — watchdog dilepas sementara jika ada update
   // =========================================================
+
+  esp_task_wdt_delete(NULL);
 
   checkAndUpdateOTA();
 
+  esp_task_wdt_add(NULL);
+  esp_task_wdt_reset();
+
   // =========================================================
-  // SETTINGS
+  // SETTINGS (termasuk cek OTA trigger Firebase)
   // =========================================================
 
   if (millis() - lastSettings >= intervalSettings) {
@@ -645,6 +680,7 @@ void loop() {
   Serial.printf("Evaporasi : %.2f mm\n", evaporasiHarian_mm);
   Serial.printf("Status    : %s\n", statusEvaporasi.c_str());
   Serial.printf("Selenoid  : %s\n", relayAktif ? "ON" : "OFF");
+  Serial.printf("OTA Ver   : %s\n", otaStatus.versiSekarang.c_str());
 
   Serial.println("================================");
 
@@ -658,18 +694,19 @@ void loop() {
 
     FirebaseJson json;
 
-    json.add("tinggi_air_cm", tinggi_cm);
-    json.add("tinggi_air_mm", tinggi_cm * 10.0);
-    json.add("suhu_air", suhuAir);
-    json.add("evaporasi_mm", evaporasiHarian_mm);
-    json.add("status", statusEvaporasi);
-    json.add("selenoid", relayAktif);
-    json.add("sensor_error", sensorError);
-    json.add("datetime", datetime);
-    json.add("d0", (int)D0);
-    json.add("dmax", (int)DMAX);
-    json.add("snapshot_cm", tinggiSnapshot_cm);
-    json.add("ota_version", otaStatus.versiSekarang);
+    json.add("tinggi_air_cm",  tinggi_cm);
+    json.add("tinggi_air_mm",  tinggi_cm * 10.0);
+    json.add("suhu_air",       suhuAir);
+    json.add("evaporasi_mm",   evaporasiHarian_mm);
+    json.add("status",         statusEvaporasi);
+    json.add("selenoid",       relayAktif);
+    json.add("sensor_error",   sensorError);
+    json.add("datetime",       datetime);
+    json.add("d0",             (int)D0);
+    json.add("dmax",           (int)DMAX);
+    json.add("snapshot_cm",    tinggiSnapshot_cm);
+    json.add("ota_version",    otaStatus.versiSekarang);
+    json.add("ota_status",     otaStatus.statusTerakhir);
 
     if (Firebase.updateNode(fbdo, PATH_REALTIME, json)) {
 
@@ -693,10 +730,10 @@ void loop() {
 
     jsonH.add("tinggi_air_cm", tinggi_cm);
     jsonH.add("tinggi_air_mm", tinggi_cm * 10.0);
-    jsonH.add("suhu_air", suhuAir);
-    jsonH.add("evaporasi_mm", evaporasiHarian_mm);
-    jsonH.add("status", statusEvaporasi);
-    jsonH.add("datetime", datetime);
+    jsonH.add("suhu_air",      suhuAir);
+    jsonH.add("evaporasi_mm",  evaporasiHarian_mm);
+    jsonH.add("status",        statusEvaporasi);
+    jsonH.add("datetime",      datetime);
 
     if (Firebase.pushJSON(fbdo, PATH_HISTORY, jsonH)) {
 
