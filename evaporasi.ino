@@ -2,7 +2,8 @@
 //  EVAPORIMETER OTOMATIS ESP32
 //  VERSI PERBAIKAN LENGKAP
 //  Fix: reset harian, watchdog, settings Firebase, selenoid guard,
-//       OTA trigger Firebase, watchdog bypass saat OTA
+//       OTA trigger Firebase, watchdog bypass saat OTA,
+//       evaporasi realtime, urutan loop diperbaiki
 // ============================================================
 
 #include <WiFi.h>
@@ -84,7 +85,7 @@ const float STANDAR_TINGGI_CM = 20.0;
 unsigned long intervalRealtime = 300000UL;
 unsigned long intervalHistory  = 600000UL;
 unsigned long intervalBaca     = 10000UL;
-unsigned long intervalSettings = 60000UL;
+unsigned long intervalSettings = 15000UL;  // 15 detik agar trigger OTA cepat respons
 
 // ============================================================
 // GLOBAL
@@ -253,7 +254,7 @@ float bacaSuhuAir() {
 }
 
 // ============================================================
-// EVAPORASI HARIAN
+// EVAPORASI REALTIME
 // ============================================================
 
 void prosesEvaporasiHarian(float tinggi_cm, int jam, int hari) {
@@ -270,7 +271,7 @@ void prosesEvaporasiHarian(float tinggi_cm, int jam, int hari) {
     return;
   }
 
-  // Reset harian jam 7 → simpan snapshot baru
+  // Reset snapshot setiap hari jam 7
   if (jam == 7 && hari != hariTerakhirReset) {
     tinggiSnapshot_cm = tinggi_cm;
     snapshotDiambil   = true;
@@ -582,18 +583,9 @@ void loop() {
   }
 
   // =========================================================
-  // OTA — watchdog dilepas sementara jika ada update
-  // =========================================================
-
-  esp_task_wdt_delete(NULL);
-
-  checkAndUpdateOTA();
-
-  esp_task_wdt_add(NULL);
-  esp_task_wdt_reset();
-
-  // =========================================================
-  // SETTINGS (termasuk cek OTA trigger Firebase)
+  // SETTINGS DULU — termasuk cek OTA trigger Firebase
+  // PENTING: harus sebelum checkAndUpdateOTA() agar trigger
+  // Firebase diproses sebelum OTA rutin berjalan
   // =========================================================
 
   if (millis() - lastSettings >= intervalSettings) {
@@ -602,6 +594,18 @@ void loop() {
 
     bacaSettingsFirebase();
   }
+
+  // =========================================================
+  // OTA RUTIN — watchdog dilepas sementara jika ada update
+  // Jalan setelah settings agar force trigger sudah diset
+  // =========================================================
+
+  esp_task_wdt_delete(NULL);
+
+  checkAndUpdateOTA();
+
+  esp_task_wdt_add(NULL);
+  esp_task_wdt_reset();
 
   // =========================================================
   // INTERVAL SENSOR
@@ -678,6 +682,7 @@ void loop() {
   Serial.printf("Tinggi    : %.2f cm\n", tinggi_cm);
   Serial.printf("Suhu Air  : %.2f C\n", suhuAir);
   Serial.printf("Evaporasi : %.2f mm\n", evaporasiHarian_mm);
+  Serial.printf("Snapshot  : %.2f cm\n", tinggiSnapshot_cm);
   Serial.printf("Status    : %s\n", statusEvaporasi.c_str());
   Serial.printf("Selenoid  : %s\n", relayAktif ? "ON" : "OFF");
   Serial.printf("OTA Ver   : %s\n", otaStatus.versiSekarang.c_str());

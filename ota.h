@@ -21,8 +21,8 @@
 #define OTA_GITHUB_REPO  "evaporasi"
 // #define OTA_GITHUB_TOKEN "ghp_GANTI_TOKEN_BARU_KAMU"
 
-#define FIRMWARE_VERSION    "v1.0."
-#define OTA_CHECK_INTERVAL  3600000UL  // cek tiap 1 jam
+#define FIRMWARE_VERSION    "v1.0.7"
+#define OTA_CHECK_INTERVAL  3600000UL  // cek rutin tiap 1 jam
 
 // ============================================================
 // STATUS OTA
@@ -266,7 +266,8 @@ inline void checkAndUpdateOTA() {
 }
 
 // ============================================================
-// FORCE OTA — bypass interval, langsung cek
+// FORCE OTA — bypass interval 1 jam, langsung cek GitHub
+// Dipanggil dari bacaSettingsFirebase() saat trigger Firebase aktif
 // ============================================================
 
 inline void forceCheckOTA() {
